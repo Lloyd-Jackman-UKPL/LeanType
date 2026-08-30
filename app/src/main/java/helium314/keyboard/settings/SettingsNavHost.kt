@@ -34,6 +34,7 @@ import helium314.keyboard.settings.screens.PersonalDictionaryScreen
 import helium314.keyboard.settings.screens.BlockedWordsScreen
 import helium314.keyboard.settings.screens.PreferencesScreen
 import helium314.keyboard.settings.screens.SecondaryLayoutScreen
+import helium314.keyboard.settings.screens.SuggestionPrimerScreen
 import helium314.keyboard.settings.screens.SubtypeScreen
 import helium314.keyboard.settings.screens.TextCorrectionScreen
 import helium314.keyboard.settings.screens.ToolbarScreen
@@ -96,6 +97,9 @@ fun SettingsNavHost(
         }
         composable(SettingsDestination.TextCorrection) {
             TextCorrectionScreen(onClickBack = ::goBack)
+        }
+        composable(SettingsDestination.SuggestionPrimers) {
+            SuggestionPrimerScreen(onClickBack = ::goBack)
         }
         composable(SettingsDestination.Preferences) {
             PreferencesScreen(onClickBack = ::goBack)
@@ -201,6 +205,7 @@ object SettingsDestination {
     const val Updates = "updates"
     const val About = "about"
     const val TextCorrection = "text_correction"
+    const val SuggestionPrimers = "suggestion_primers"
     const val Preferences = "preferences"
     const val Toolbar = "toolbar"
     const val GestureTyping = "gesture_typing"

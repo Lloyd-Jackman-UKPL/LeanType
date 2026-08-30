@@ -214,7 +214,12 @@ fun createAboutSettings(context: Context) = listOf(
                     os.bufferedWriter().use { writer ->
                         // Stream the logcat line by line to avoid allocating a multi-MB
                         // String in memory (the IME process can OOM on long-running devices).
-                        ProcessBuilder("logcat", "-d", "-b", "all", "*:W").start().inputStream.use { stream ->
+                        // Filter: everything from the primer/learning tags at ANY level
+                        // (their diagnostics are Info-level and essential for pack analysis),
+                        // plus Warning-and-above for everything else (default).
+                        ProcessBuilder("logcat", "-d", "-b", "all",
+                            "PgenPrimerDictionary:V", "PersonalNGram:V", "DictionaryFacilitatorImpl:V",
+                            "*:W").start().inputStream.use { stream ->
                             stream.bufferedReader().useLines { lines: Sequence<String> ->
                                 for (line: String in lines) {
                                     writer.write(line)

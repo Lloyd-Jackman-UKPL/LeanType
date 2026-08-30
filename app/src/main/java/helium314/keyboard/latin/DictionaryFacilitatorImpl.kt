@@ -6,8 +6,12 @@
 package helium314.keyboard.latin
 
 import android.Manifest
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.SharedPreferences
+import androidx.core.content.ContextCompat
 import android.provider.UserDictionary
 import android.util.LruCache
 import helium314.keyboard.keyboard.Keyboard
@@ -23,6 +27,7 @@ import helium314.keyboard.latin.common.decapitalize
 import helium314.keyboard.latin.common.mightBeEmoji
 import helium314.keyboard.latin.common.splitOnWhitespace
 import helium314.keyboard.latin.define.DebugFlags
+import helium314.keyboard.latin.dictionary.AINextWordDictionary
 import helium314.keyboard.latin.dictionary.AppsBinaryDictionary
 import helium314.keyboard.latin.dictionary.ContactsBinaryDictionary
 import helium314.keyboard.latin.dictionary.Dictionary
@@ -33,8 +38,12 @@ import helium314.keyboard.latin.dictionary.UserBinaryDictionary
 import helium314.keyboard.latin.permissions.PermissionsUtil
 import helium314.keyboard.latin.personalization.SessionWordBoost
 import helium314.keyboard.latin.personalization.UserHistoryDictionary
+import helium314.keyboard.personalization.PersonalNGram
+import helium314.keyboard.personalization.PgenPrimer
+import helium314.keyboard.personalization.PgenPrimerDictionary
 import helium314.keyboard.latin.settings.Settings
 import helium314.keyboard.latin.settings.SettingsValuesForSuggestion
+import helium314.keyboard.latin.utils.AINextWordEngineFactory
 import helium314.keyboard.latin.utils.Log
 import helium314.keyboard.latin.utils.SubtypeSettings
 import helium314.keyboard.latin.utils.SuggestionResults
@@ -68,6 +77,7 @@ class DictionaryFacilitatorImpl : DictionaryFacilitator {
     private var mContext: Context? = null
     private var mEnabledDictionariesState: Map<String, Boolean> = emptyMap()
     private var mLoadedDownloadPrefs: Map<String, Any?> = emptyMap()
+    private var mLoadedAINextWord: Boolean? = null
     private var dictionaryGroups = listOf(DictionaryGroup())
 
     private val initializedMainDictionary = java.util.concurrent.atomic.AtomicBoolean(false)
@@ -111,6 +121,45 @@ class DictionaryFacilitatorImpl : DictionaryFacilitator {
     // Limit parallelism to prevent excessive CPU usage during dictionary operations
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default.limitedParallelism(2))
 
+    // Optional AI next-word dictionary (LeanType). Null when the feature is off or the engine
+    // cannot be built (factory gates on the pref / model availability).
+    private var aiNextWordDict: AINextWordDictionary? = null
+
+    // Runnable that LatinIME registers so we can ask it to redraw the suggestion strip once the
+    // AI next-word dictionary has cached fresh candidates (see setNextWordRefreshListener).
+    private var nextWordRefreshListener: (() -> Unit)? = null
+
+    @Volatile
+    private var aiNextWordContextText: String? = null
+
+    @Volatile private var aiNextWordAppPackage: String? = null
+    @Volatile private var aiNextWordAppLanguage: String? = null
+    @Volatile private var aiNextWordNoLearning: Boolean = false
+    @Volatile private var aiNextWordPersistedContext: String? = null
+
+    // ---- Angle-2 primer candidate source (LOCAL-TEST build). Candidate producer + ranker only;
+    // -------------- GUARDRAIL: never writes text, never touches gesture/composing path. ----
+    private var mPgenEnabled = false
+    private var mPgenPrimer: PgenPrimer? = null
+
+    /** Personal n-gram counts live OUTSIDE the loader so learned words survive dictionary
+     *  resets / locale switches within the process, AND are persisted to disk (constructed
+     *  lazily once a Context is available) so they survive process death entirely. */
+    private var mPgenPersonal: PersonalNGram? = null
+    private var mPgenDict: PgenPrimerDictionary? = null
+
+    /** Only the most recent load wins (resetDictionaries can fire faster than a big pack parses). */
+    @Volatile private var mPgenLoadSeq = 0
+
+    /**
+     * Reload primer packs when they change (import/delete in Settings → Suggestion Primer Packs,
+     * or the master toggle). App-scoped broadcast; receiver re-resolves for the active locale.
+     */
+    private var mPgenPacksReceiver: BroadcastReceiver? = null
+
+    /** Locale the primer pack was last resolved for (drives reload on broadcast + on commit). */
+    @Volatile private var mPgenActiveLocale: Locale = Locale.getDefault()
+
     override fun setValidSpellingWordReadCache(cache: LruCache<String, Boolean>) {
         mValidSpellingWordReadCache = cache
     }
@@ -142,6 +191,132 @@ class DictionaryFacilitatorImpl : DictionaryFacilitator {
         return sessionWordBoost ?: SessionWordBoost.getInstance(context).also { sessionWordBoost = it }
     }
 
+    override fun setNextWordRefreshListener(listener: Runnable?) {
+        nextWordRefreshListener = listener?.let { { it.run() } }
+    }
+
+    override fun setAINextWordContextText(text: String?) {
+        aiNextWordContextText = text
+    }
+
+    override fun setAINextWordAppInfo(
+        packageName: String?, language: String?, noLearning: Boolean, persistedContext: String?
+    ) {
+        aiNextWordAppPackage = packageName
+        aiNextWordAppLanguage = language
+        aiNextWordNoLearning = noLearning
+        aiNextWordPersistedContext = persistedContext
+    }
+
+    private fun ensurePgenPacksReceiver(context: Context) {
+        if (mPgenPacksReceiver != null) return
+        val r = object : BroadcastReceiver() {
+            override fun onReceive(ctx: Context, intent: Intent) {
+                if (intent.action == ACTION_PRIMER_CLEAR_LEARNED) {
+                    Log.i(TAG, "clearing learned words")
+                    getPersonal(ctx).clear()
+                    return
+                }
+                Log.i(TAG, "PgenPrimer packs changed — reloading")
+                initPgenPrimer(ctx, mPgenActiveLocale)
+            }
+        }
+        ContextCompat.registerReceiver(
+            context.applicationContext, r, IntentFilter(DictionaryFacilitatorImpl.ACTION_PRIMER_PACKS_CHANGED),
+            ContextCompat.RECEIVER_NOT_EXPORTED
+        )
+        mPgenPacksReceiver = r
+    }
+
+    /** Personal counter singleton-for-this-facilitator; constructed on first use with its store file. */
+    private fun getPersonal(context: Context): PersonalNGram =
+        mPgenPersonal ?: synchronized(this) {
+            mPgenPersonal ?: PersonalNGram(PersonalNGram.countsFile(context.applicationContext.filesDir))
+                .also { mPgenPersonal = it }
+        }
+
+    /**
+     * Load the angle-1 primer pack as a candidate source. Pack resolution per active locale:
+     *   1. external files dir: <files>/primer/<lang>_<REGION>/pgen.json, <files>/primer/<lang>/pgen.json,
+     *      flat pgen_<lang>_<REGION>.json / pgen_<lang>.json, legacy flat <files>/primer/pgen.json
+     *   2. bundled mini assets: assets/primer/<lang>_<REGION>/pgen.json, assets/primer/<lang>/pgen.json
+     * Full-size packs parse OFF the main thread; suggestions run stock until the load lands.
+     */
+    private fun initPgenPrimer(context: Context, locale: Locale) {
+        ensurePgenPacksReceiver(context)
+        mPgenEnabled = context.prefs().getBoolean("pref_pgen_primer_enabled", false)
+        if (!mPgenEnabled) {
+            mPgenDict = null
+            return
+        }
+        mPgenActiveLocale = locale
+        val appContext = context.applicationContext
+        val seq = ++mPgenLoadSeq
+        scope.launch {
+            val t0 = System.currentTimeMillis()
+            val pssBefore = android.os.Debug.MemoryInfo().also { android.os.Debug.getMemoryInfo(it) }.getTotalPss()
+            val result = try {
+                loadPgenPack(appContext, locale)
+            } catch (t: Throwable) {
+                Log.e(TAG, "PgenPrimer: load failed for $locale (${System.currentTimeMillis() - t0}ms) — running stock", t)
+                null
+            }
+            if (seq != mPgenLoadSeq) return@launch // superseded by a newer reset — discard
+            val ms = System.currentTimeMillis() - t0
+            if (result == null) {
+                mPgenDict = null
+                Log.i(TAG, "PgenPrimer: no usable pack for $locale (${ms}ms) — running stock")
+            } else {
+                try {
+                    mPgenPrimer = result.first
+                    mPgenDict = PgenPrimerDictionary(result.third, result.first, getPersonal(appContext))
+                    val pssAfter = android.os.Debug.MemoryInfo().also { android.os.Debug.getMemoryInfo(it) }.getTotalPss()
+                    Log.i(TAG, "PgenPrimer loaded [${result.second}] in ${ms}ms: ${result.first.describe()}"
+                            + " estHeap=${result.first.estimatedHeapMB()}MB pssΔ=${pssAfter - pssBefore}KB"
+                            + " retPss=${pssAfter}KB")
+                } catch (t: Throwable) {
+                    mPgenPrimer = null
+                    mPgenDict = null
+                    Log.e(TAG, "PgenPrimer: post-load init failed — running stock", t)
+                }
+            }
+        }
+    }
+
+    /** Try external sideloaded packs first, then bundled assets. Null = nothing usable for [locale]. */
+    private fun loadPgenPack(context: Context, locale: Locale): Triple<PgenPrimer, String, Locale>? {
+        val lang = locale.language.lowercase(Locale.US)
+        val region = locale.country?.uppercase(Locale.US).orEmpty()
+        val tags = if (region.isNotEmpty()) listOf("${lang}_$region", lang) else listOf(lang)
+
+        // ONE naming scheme everywhere: pgen_<lang>[_<REGION>].json
+        // 1) sideloaded/imported packs in the external files dir (the intended channel)
+        context.getExternalFilesDir(null)?.let { root ->
+            val candidates = ArrayList<File>(tags.size + 1)
+            for (tag in tags) candidates.add(File(root, "primer/pgen_$tag.json"))
+            // legacy ambiguous flat name — last resort only
+            candidates.add(File(root, "primer/pgen.json"))
+            for (f in candidates) {
+                if (!f.isFile || f.length() == 0L) continue
+                try {
+                    return Triple(PgenPrimer.fromFile(f), "external:${f.name}", locale)
+                } catch (t: Throwable) {
+                    Log.e(TAG, "PgenPrimer: failed to parse ${f.path} — trying next candidate", t)
+                }
+            }
+        }
+        // 2) bundled pack(s), same flat naming inside assets/
+        for (tag in tags) {
+            val asset = "primer/pgen_${tag.replace('-', '_')}.json"
+            try {
+                context.assets.open(asset).use { ins ->
+                    return Triple(PgenPrimer.fromStream(ins), "asset:$asset", locale)
+                }
+            } catch (e: Exception) { /* no bundled pack for this tag — try next */ }
+        }
+        return null
+    }
+
     override fun isActive(): Boolean {
         return dictionaryGroups[0].locale.language.isNotEmpty()
     }
@@ -161,6 +336,10 @@ class DictionaryFacilitatorImpl : DictionaryFacilitator {
                 .mapValues { it.value as? Boolean ?: true }
             val currentDownloadPrefs = prefs.all.filterKeys { it.startsWith("pref_dict_download_link_") }
             if (currentPrefs != mEnabledDictionariesState || currentDownloadPrefs != mLoadedDownloadPrefs) {
+                return false
+            }
+            val aiNextWord = prefs.getBoolean(Settings.PREF_AI_NEXT_WORD, false)
+            if (aiNextWord != mLoadedAINextWord) {
                 return false
             }
         }
@@ -198,10 +377,15 @@ class DictionaryFacilitatorImpl : DictionaryFacilitator {
             .mapValues { it.value as? Boolean ?: true }
         mLoadedDownloadPrefs = prefs.all.filterKeys { it.startsWith("pref_dict_download_link_") }
 
+        // Track the AI next-word pref so the dictionary group is rebuilt when it is toggled.
+        mLoadedAINextWord = prefs.getBoolean(Settings.PREF_AI_NEXT_WORD, false)
+
         // Initialize session word boost with context if not yet done
         if (sessionWordBoost == null) {
             sessionWordBoost = SessionWordBoost.getInstance(context)
         }
+
+        initPgenPrimer(context, newLocale)
 
         val locales = getUsedLocales(newLocale, context)
 
@@ -241,6 +425,14 @@ class DictionaryFacilitatorImpl : DictionaryFacilitator {
 
         mValidSpellingWordWriteCache?.evictAll()
         mValidSpellingWordReadCache?.evictAll()
+
+        // AI next-word dictionary: rebuilt on every dictionary reset. Factory returns null when
+        // the feature is disabled or the engine cannot be built, making this a no-op by default.
+        aiNextWordDict = AINextWordEngineFactory.create(context)?.let {
+            AINextWordDictionary(it, scope).also { dict ->
+                dict.onCandidatesReady = { nextWordRefreshListener?.invoke() }
+            }
+        }
     }
 
     /** creates dictionaryGroups for [newLocales] with given [newSubDictTypes], trying to re-use existing dictionaries.
@@ -473,6 +665,21 @@ class DictionaryFacilitatorImpl : DictionaryFacilitator {
         // We don't add words with 0-frequency (assuming they would be profanity etc.).
         val isValid = mainFreq > 0
         UserHistoryDictionary.addToDictionary(userHistoryDictionary, ngramContext, wordToUse, isValid, timeStampInSeconds)
+
+        // Feed the committed word into the angle-2 primer source (personal counts learn as the user
+        // types). Learning must not depend on a primer pack being loaded — counts accumulate from
+        // session one and are used the moment any pack becomes active.
+        run {
+            val pv = ngramContext.extractPrevWordsContextArray()
+            val p1 = pv.getOrNull(0)
+            val p2 = pv.getOrNull(1)
+            val dict = mPgenDict
+            if (dict != null) {
+                dict.onWordCommitted(wordToUse, p1, p2)
+            } else {
+                getPersonal(mContext ?: return).record(wordToUse, p1, p2, System.currentTimeMillis())
+            }
+        }
     }
 
     private val DICTIONARY_TYPES_EXCLUDING_HISTORY = arrayOf(
@@ -664,6 +871,54 @@ class DictionaryFacilitatorImpl : DictionaryFacilitator {
 
         if (composedData.mTypedWord.isEmpty() && !composedData.mIsBatchMode) {
             pruneNextWordCandidates(suggestionResults)
+
+            // ---- Unified next-word sources (lean-Type angle-2, merged Aug 2026) ----
+            // Primer pack is the PRIMARY, always-on path: a deterministic generic + personalised
+            // prior merged at AOSP-competitive scores. It co-exists with the LIGHT/SPARSE live-LLM
+            // path below, which is only fired when the primer+AOSP strip is thin (low confidence),
+            // so the heavy model never barges into a well-populated strip (the 3-angle design).
+            val aiBaseCount = suggestionResults.size
+            mPgenDict?.let { pgen ->
+                try {
+                    val ps = pgen.getSuggestions(composedData, ngramContext, proximityInfoHandle,
+                        settingsValuesForSuggestion, sessionId, 1.0f,
+                        weightOfLangModelVsSpatialModel)
+                    if (ps != null && ps.isNotEmpty()) suggestionResults.addAll(ps)
+                } catch (e: Exception) {
+                    Log.e(TAG, "PgenPrimer getSuggestions failed", e)
+                }
+            }
+            // Sparse live-LLM: only when the strip is below the low-confidence threshold after the
+            // primer merge, so AI adds EXTRA choices instead of displacing AOSP/primer ones.
+            if (suggestionResults.size < AI_NEXT_WORD_MIN_BASE_CANDIDATES) {
+                aiNextWordDict?.let { dict ->
+                    dict.prevTextForPrompt = aiNextWordContextText
+                    dict.appPackageName = aiNextWordAppPackage
+                    dict.appLanguageHint = aiNextWordAppLanguage
+                    dict.noLearning = aiNextWordNoLearning
+                    dict.appContext = if (aiNextWordNoLearning) null else aiNextWordPersistedContext
+                    val aiInfos = dict.getSuggestions(
+                        composedData, ngramContext, proximityInfoHandle, settingsValuesForSuggestion,
+                        sessionId, 1.0f,
+                        weightOfLangModelVsSpatialModel
+                    )?.filter { it.word.isNotEmpty() }
+                    if (!aiInfos.isNullOrEmpty()) {
+                        val floor = ((suggestionResults.maxOfOrNull { it.mScore }?.let { it } ?: AI_NEXT_WORD_BASE_SCORE))
+                        aiInfos.forEachIndexed { i, info ->
+                            val score = floor - i - 1
+                            suggestionResults.add(
+                                if (info.mScore == score) info
+                                else SuggestedWordInfo(
+                                    info.mWord, info.mPrevWordsContext, score, info.mKindAndFlags,
+                                    info.mSourceDict, info.mIndexOfTouchPointOfSecondWord,
+                                    info.mAutoCommitFirstWordConfidence
+                                )
+                            )
+                        }
+                    }
+                }
+            }
+            if (BuildConfig.DEBUG) Log.d(TAG, "unified next-word: aiBase=$aiBaseCount final=${suggestionResults.size}")
         }
 
         if (BuildConfig.DEBUG && DebugFlags.SCORE_AUDIT && composedData.mTypedWord.isEmpty()) {
@@ -985,6 +1240,19 @@ class DictionaryFacilitatorImpl : DictionaryFacilitator {
 
     companion object {
         private val TAG = DictionaryFacilitatorImpl::class.java.simpleName
+
+        /**
+         * App-internal broadcasts: primer pack files changed (import/delete/toggle) → reload;
+         * learned-words wipe request from Settings → Libraries → Suggestion Primer Packs.
+         */
+        const val ACTION_PRIMER_PACKS_CHANGED = "helium314.keyboard.ACTION_PRIMER_PACKS_CHANGED"
+        const val ACTION_PRIMER_CLEAR_LEARNED = "helium314.keyboard.ACTION_PRIMER_CLEAR_LEARNED"
+
+        // Fallback base when there are no AOSP suggestions to rank AI words below.
+        private const val AI_NEXT_WORD_BASE_SCORE = 1000
+
+        // Below this many candidates after the primer merge, the sparse live-LLM path is fired.
+        private const val AI_NEXT_WORD_MIN_BASE_CANDIDATES = 3
 
         // HACK: This threshold is being used when adding a capitalized entry in the User History dictionary.
         private const val CAPITALIZED_FORM_MAX_PROBABILITY_FOR_INSERT = 140

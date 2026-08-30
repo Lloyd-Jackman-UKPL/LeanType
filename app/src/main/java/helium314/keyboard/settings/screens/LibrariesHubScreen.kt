@@ -89,6 +89,14 @@ fun LibrariesHubScreen(
                             ) { if (isSupported) NextScreenIcon() }
                         }
 
+                        // Suggestion Primer Packs (loadable next-word primer libraries)
+                        Preference(
+                            name = "Suggestion Primer Packs",
+                            description = "Loadable word-pattern libraries for next-word suggestions",
+                            onClick = { helium314.keyboard.settings.SettingsDestination.navigateTo(helium314.keyboard.settings.SettingsDestination.SuggestionPrimers) },
+                            icon = R.drawable.ic_autocorrect
+                        ) { NextScreenIcon() }
+
                         // Handwriting Input Plugin (ML Kit based)
                         val isHandwritingSupported = android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O
                         val handwritingInstalled = isHandwritingSupported && HandwritingLoader.hasPlugin(context)
